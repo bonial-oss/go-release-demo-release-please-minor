@@ -1,0 +1,283 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'release' to force-cut a release from current main (skips the Release-PR gate)"
+        required: false
+        default: ""
+      force_release_version:
+        description: "Force-cut this version (e.g. '1.0.0' without the 'v' prefix). Bypasses release-please detection entirely — for recovering from a stuck manifest state. Requires confirm=release."
+        required: false
+        default: ""
+
+permissions: read-all
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create Release PR, tag the release commit
+      pull-requests: write   # open/update the Release PR
+    outputs:
+      release_created: ${{ steps.decide.outputs.release_created }}
+      version:         ${{ steps.decide.outputs.version }}
+      tag_name:        ${{ steps.decide.outputs.tag_name }}
+    steps:
+      - name: Checkout (needed for manifest-delta fallback detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD + HEAD~1 for manifest-delta diff
+
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Consolidate release decision (release-please + fallbacks)
+        # release-please with `skip-github-tag: true` + `skip-github-release: true`
+        # does NOT emit `release_created=true` on Release-PR merge — the workflow
+        # is expected to own tag+release creation. Fall back to two other signals:
+        #   (a) manifest-delta: `.release-please-manifest.json` version differs
+        #       from HEAD~1 → a Release PR was just merged.
+        #   (b) `force_release_version` input on workflow_dispatch → operator
+        #       override for recovery from a stuck manifest state.
+        # (a) is the automatic path for normal Release-PR merges; (b) is the
+        # escape hatch.
+        id: decide
+        shell: bash
+        env:
+          RP_CREATED: ${{ steps.rp.outputs.release_created }}
+          RP_VERSION: ${{ steps.rp.outputs.version }}
+          RP_TAG:     ${{ steps.rp.outputs.tag_name }}
+          FORCE:      ${{ inputs.force_release_version }}
+          CONFIRM:    ${{ inputs.confirm }}
+          EVENT:      ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # 1) workflow_dispatch force-cut path — requires confirm=release
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$FORCE" ]; then
+            if [ "$CONFIRM" != "release" ]; then
+              echo "::error::force_release_version was set but confirm != 'release'. Re-dispatch with both."
+              exit 1
+            fi
+            echo "::notice::Force-cut path: version=${FORCE}"
+            {
+              echo "release_created=true"
+              echo "version=${FORCE}"
+              echo "tag_name=v${FORCE}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2) release-please's own signal — honor it
+          if [ "$RP_CREATED" = "true" ]; then
+            # workflow_dispatch dry-run gate: skip downstream unless confirm=release
+            if [ "$EVENT" = "workflow_dispatch" ] && [ "$CONFIRM" != "release" ]; then
+              echo "::notice::Dry-run: release-please would cut ${RP_TAG}. Re-dispatch with confirm=release to proceed."
+              echo "release_created=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            {
+              echo "release_created=true"
+              echo "version=${RP_VERSION}"
+              echo "tag_name=${RP_TAG}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3) manifest-delta fallback — release-please with both skip flags won't
+          # emit release_created on Release-PR merge, but the manifest change is
+          # the reliable signal that a merge just landed.
+          CURRENT=$(jq -r '."."' .release-please-manifest.json)
+          PREV=$(git show HEAD~1:.release-please-manifest.json 2>/dev/null | jq -r '."."' || echo "0.0.0")
+          if [ "$CURRENT" != "$PREV" ]; then
+            echo "::notice::Manifest-delta fallback: ${PREV} -> ${CURRENT}"
+            {
+              echo "release_created=true"
+              echo "version=${CURRENT}"
+              echo "tag_name=v${CURRENT}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 4) Nothing to release
+          echo "No release warranted. release-please: created=${RP_CREATED}; manifest unchanged at ${CURRENT}."
+          echo "release_created=false" >> "$GITHUB_OUTPUT"
+
+  goreleaser:
+    needs: release-please
+    if: |
+      needs.release-please.outputs.release_created == 'true'
+      && (github.event_name != 'workflow_dispatch' || inputs.confirm == 'release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push tag, create draft release, upload assets
+      id-token: write   # cosign keyless via OIDC
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
+      tag_name: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - name: Preflight — tag must not already exist as a moved ref; delete stale draft release if present
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # If a draft release for this tag already exists from a previous
+          # failed attempt, delete it so GoReleaser starts clean. Published
+          # releases would fail this delete — that's intentional.
+          if gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "::warning::Stale draft release for ${TAG} exists — deleting so GoReleaser starts clean."
+            gh release delete "$TAG" --yes --repo "$REPO"
+          fi
+
+      - name: Checkout at main (with full history for GoReleaser changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Create and push the release tag
+        # release-please creates the tag on the release commit via the
+        # GitHub API. That's asynchronous relative to this workflow run,
+        # and even if it's already applied, our local checkout may not
+        # see it. Explicitly create + push the tag here as idempotently
+        # as possible.
+        shell: bash
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # If the tag already exists locally (release-please just created it),
+          # this is a no-op. Otherwise, tag HEAD (which is the release commit).
+          if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            git tag -a "$TAG" -m "Release $TAG"
+          fi
+          # Push idempotently — if origin already has the tag at this SHA,
+          # this exits 0.
+          git push origin "$TAG" || {
+            # If push failed because the tag exists remotely, verify it points
+            # at our HEAD and succeed. Otherwise re-raise.
+            REMOTE_SHA=$(git ls-remote origin "refs/tags/$TAG" | awk '{print $1}')
+            LOCAL_SHA=$(git rev-parse HEAD)
+            if [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
+              echo "Tag $TAG already at HEAD on origin; continuing."
+            else
+              echo "::error::Tag $TAG exists on origin but points at $REMOTE_SHA, not HEAD ($LOCAL_SHA)." >&2
+              exit 1
+            fi
+          }
+
+      - name: GoReleaser (build, sign, SBOM, create draft release)
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.release-please.outputs.tag_name }}
+        with:
+          version: "~> v2"
+          args: release --clean
+
+      - name: Emit hashes for SLSA consumer
+        id: hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "hashes=$(base64 -w0 < dist/checksums.txt)" >> "$GITHUB_OUTPUT"
+
+  slsa:
+    needs: goreleaser
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.goreleaser.outputs.hashes }}"
+      upload-assets: true
+      upload-tag-name: ${{ needs.goreleaser.outputs.tag_name }}
+      draft-release: true
+
+  promote:
+    needs: [goreleaser, slsa]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Publish the draft release (last write; immutable-releases-safe)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.goreleaser.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --repo "$REPO"
+          gh release view "$TAG" --repo "$REPO" \
+            --json name,tagName,isDraft,isPrerelease,url --jq '.'
+
+      - name: Job summary
+        shell: bash
+        env:
+          TAG: ${{ needs.goreleaser.outputs.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "## Release published"
+            echo ""
+            echo "- Tag: \`$TAG\`"
+            echo "- Cosign identity: \`https://github.com/$REPO/.github/workflows/release.yaml@refs/heads/main\`"
+            echo "- Provenance: attached as \`multiple.intoto.jsonl\`"
+            echo "- Immutable-releases setting: expected ON (verify via repo settings)"
+            echo ""
+            echo "Verify from a consumer's side with the commands in \`docs/verification.md\`."
+            echo ""
+            echo "Then manually dispatch \`verify-release.yaml --field tag=$TAG\`."
+            echo "(Auto-trigger on \`released\` event is suppressed under GITHUB_TOKEN — see README.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue on failure of any prior job
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ needs.goreleaser.outputs.tag_name }}
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Release ${process.env.TAG} failed`,
+              body: `Release workflow failed. Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nDelete any stale draft release before retrying.`,
+              labels: ['release-failure']
+            });

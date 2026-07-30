@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - sayRepetitiveInsteadOfStutters
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
