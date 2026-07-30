@@ -1,6 +1,7 @@
 {
   "release-type": "go",
   "include-v-in-tag": true,
+  "bump-minor-pre-major": true,
   "packages": {
     ".": {
       "package-name": "go-release-demo-release-please-minor",
