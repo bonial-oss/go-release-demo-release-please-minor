@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+name: verify-release
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (e.g. v0.1.0)"
+        required: true
+
+permissions: read-all
+
+jobs:
+  rebuild-and-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - name: Determine target tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.value }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          install-only: true
+
+      - name: Rebuild the ${{ matrix.goos }}/${{ matrix.goarch }} archive from the tagged commit
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          goreleaser build --clean --single-target --id demo \
+            -o "rebuilt_demo_${{ matrix.goos }}_${{ matrix.goarch }}"
+
+      - name: Download the released archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "demo_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" \
+            --dir released
+          tar -C released -xzf "released/demo_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
+
+      - name: Compare SHA256 of rebuilt vs. released binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          REBUILT_SUM=$(sha256sum "rebuilt_demo_${{ matrix.goos }}_${{ matrix.goarch }}" | awk '{print $1}')
+          RELEASED_SUM=$(sha256sum released/demo | awk '{print $1}')
+          echo "Rebuilt:  $REBUILT_SUM"
+          echo "Released: $RELEASED_SUM"
+          if [ "$REBUILT_SUM" != "$RELEASED_SUM" ]; then
+            echo "::error::Reproducibility check FAILED for ${{ matrix.goos }}/${{ matrix.goarch }}" >&2
+            exit 1
+          fi
+          echo "::notice::Reproducibility OK for ${{ matrix.goos }}/${{ matrix.goarch }}: $REBUILT_SUM"
+
+  verify-signatures:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Determine target tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install slsa-verifier
+        uses: slsa-framework/slsa-verifier/actions/installer@v2.6.0
+
+      - name: Download release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "checksums.txt" \
+            --pattern "checksums.txt.sig" \
+            --pattern "checksums.txt.pem" \
+            --pattern "multiple.intoto.jsonl" \
+            --pattern "demo_*.tar.gz" \
+            --dir assets
+          ls -la assets/
+
+      - name: Verify cosign signature over checksums.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --certificate-identity-regexp='^https://github.com/${{ github.repository }}/\.github/workflows/release\.yaml@refs/heads/main$' \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            --signature assets/checksums.txt.sig \
+            --certificate assets/checksums.txt.pem \
+            assets/checksums.txt
+
+      - name: Verify SLSA provenance
+        # The release workflow runs on `push: main`, so the SLSA
+        # provenance encodes `refs/heads/main` as the source ref, not the
+        # tag. Verify against the branch, not the tag. Tag binding is
+        # provided by the goreleaser-created release object itself,
+        # which is signed via cosign (previous step).
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for archive in assets/demo_*.tar.gz; do
+            slsa-verifier verify-artifact \
+              --provenance-path assets/multiple.intoto.jsonl \
+              --source-uri "github.com/$REPO" \
+              --source-branch main \
+              "$archive"
+          done

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: go-release-demo-release-please-minor
+  description: >
+    Combo 1 reference implementation of immutable Go releases using
+    release-please + GoReleaser. Demonstrates the Release-PR proposal
+    loop, atomic three-job release execution (goreleaser → slsa →
+    promote), cosign keyless signing, SLSA L3 provenance, reproducible
+    builds, and GitHub's immutable-releases setting. Companion to
+    bonial-oss/go-release-demo (the meta / decision repo) and
+    bonial-oss/go-release-demo-goreleaser-svu (Combo 2 sibling).
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  links:
+    - title: GitHub project
+      url: https://github.com/bonial-oss/go-release-demo-release-please-minor
+    - title: Meta / design docs
+      url: https://github.com/bonial-oss/go-release-demo
+    - title: Design spec — atomic release workflow
+      url: https://github.com/bonial-oss/go-release-demo/blob/main/docs/superpowers/specs/2026-07-23-immutable-releases-design.md
+    - title: Combo 2 sibling repo (GoReleaser + svu)
+      url: https://github.com/bonial-oss/go-release-demo-goreleaser-svu
+  tags:
+    - go
+    - release-engineering
+    - reference-implementation
+    - immutable-releases
+    - combo-1
+    - release-please
+spec:
+  type: tool
+  lifecycle: experimental
+  owner: platform-engineering

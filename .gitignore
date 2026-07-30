@@ -1,0 +1,22 @@
+# Local REUSE virtualenv (Task 3 setup)
+.venv-reuse/
+
+# Editor / OS junk
+.idea/
+.vscode/
+.DS_Store
+
+# Working trees
+.worktrees/
+.claude/
+.superpowers/
+
+# Go build artifacts
+/demo
+/dist/
+/coverage.out
+/coverage.html
+vendor/
+
+# Node artifacts (from occasional npx use, e.g. markdownlint-cli2)
+node_modules/

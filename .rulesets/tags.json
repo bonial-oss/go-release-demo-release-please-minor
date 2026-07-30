@@ -1,0 +1,18 @@
+{
+  "name": "protect-version-tags",
+  "target": "tag",
+  "enforcement": "evaluate",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/tags/v[0-9]+.[0-9]+.[0-9]+"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "creation" },
+    { "type": "update" },
+    { "type": "deletion" },
+    { "type": "non_fast_forward" }
+  ],
+  "bypass_actors": []
+}
